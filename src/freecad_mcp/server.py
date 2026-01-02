@@ -1,5 +1,6 @@
 import json
 import logging
+import socket
 import xmlrpc.client
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, Literal
@@ -13,6 +14,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("FreeCADMCPserver")
 
+# 全局设置超时，防止 XMLRPC 永久阻塞
+socket.setdefaulttimeout(30.0)
 
 _only_text_feedback = False
 
@@ -520,6 +523,16 @@ def get_view(
         A screenshot of the active view.
     """
     freecad = get_freecad_connection()
+
+    # ---  新增代码：强制相机对焦 ---
+    try:
+        # 发送一段代码让 FreeCAD 调整相机视角（FitAll）
+        # 这相当于点击了工具栏里的 "Fit All" 按钮
+        freecad.execute_code("FreeCAD.Gui.SendMsgToActiveView('ViewFit')")
+    except Exception as e:
+        logger.warning(f"Auto-fit camera failed: {e}")
+    # -------------------------------
+
     screenshot = freecad.get_active_screenshot(view_name)
 
     if screenshot is not None:
@@ -572,7 +585,143 @@ def insert_part_from_library(
                 type="text", text=f"Failed to insert part from library: {str(e)}"
             )
         ]
+    
+@mcp.tool()
+def create_primitive(
+    ctx: Context, 
+    doc_name: str, 
+    primitive_type: Literal["Box", "Cylinder", "Sphere", "Cone", "Torus"], 
+    name: str, 
+    dimensions: dict[str, float],
+    placement: dict[str, Any] = None
+) -> list[TextContent]:
+    """
+    Create a basic geometric primitive in FreeCAD.
+    
+    Args:
+        doc_name: Document name.
+        primitive_type: One of Box, Cylinder, Sphere, Cone, Torus.
+        name: Name for the new object.
+        dimensions: Dictionary of dimensions (e.g., {'Length': 10, 'Width': 10} for Box).
+        placement: Optional placement (position/rotation).
+    """
+    freecad = get_freecad_connection()
+    
+    # 映射类型到 FreeCAD 内部名称
+    type_map = {
+        "Box": "Part::Box",
+        "Cylinder": "Part::Cylinder",
+        "Sphere": "Part::Sphere",
+        "Cone": "Part::Cone",
+        "Torus": "Part::Torus"
+    }
+    
+    if primitive_type not in type_map:
+        return [TextContent(type="text", text=f"Error: Unknown primitive type {primitive_type}")]
 
+    obj_data = {
+        "Name": name,
+        "Type": type_map[primitive_type],
+        "Properties": dimensions
+    }
+    
+    if placement:
+        obj_data["Properties"]["Placement"] = placement
+
+    try:
+        res = freecad.create_object(doc_name, obj_data)
+        # 修改点：不再获取截图，避免 Pydantic 校验错误
+        
+        if res["success"]:
+            msg = f"Success: Created {primitive_type} '{res['object_name']}'."
+            return [TextContent(type="text", text=msg)]
+        else:
+            msg = f"Failed: {res.get('error')}"
+            return [TextContent(type="text", text=msg)]
+        
+        # 原来的 return add_screenshot_if_available... 已被删除
+        
+    except Exception as e:
+        return [TextContent(type="text", text=f"Critical Error: {str(e)}")]
+
+
+@mcp.tool()
+def create_gear(ctx: Context, doc_name: str, teeth: int, module: float) -> str:
+    """
+    Create a gear geometry in FreeCAD.
+    Returns a text summary. The visual verification will be handled by the 'get_view' tool later.
+    
+    Args:
+        doc_name: The name of the document.
+        teeth: Number of teeth.
+        module: Gear module size.
+    """
+    freecad = get_freecad_connection()
+    
+    # 依然使用三角函数计算精确几何
+    code = f"""
+import FreeCAD
+import Part
+import math
+from FreeCAD import Vector
+
+doc = FreeCAD.getDocument("{doc_name}")
+if not doc:
+    doc = FreeCAD.newDocument("{doc_name}")
+
+# --- 齿轮参数 ---
+num_teeth = {teeth}
+mod = {module}
+thickness = 10 
+
+# 计算半径
+pitch_radius = mod * num_teeth / 2.0
+addendum = mod
+dedendum = 1.25 * mod
+outer_radius = pitch_radius + addendum
+root_radius = pitch_radius - dedendum
+
+# --- 生成轮廓 ---
+points = []
+for i in range(num_teeth):
+    angle_base = 2 * math.pi * i / num_teeth
+    angle_step = (2 * math.pi / num_teeth) / 4.0
+    
+    # 四点法拟合渐开线
+    points.append(Vector(root_radius * math.cos(angle_base), root_radius * math.sin(angle_base), 0))
+    points.append(Vector(outer_radius * math.cos(angle_base + angle_step), outer_radius * math.sin(angle_base + angle_step), 0))
+    points.append(Vector(outer_radius * math.cos(angle_base + 2*angle_step), outer_radius * math.sin(angle_base + 2*angle_step), 0))
+    points.append(Vector(root_radius * math.cos(angle_base + 3*angle_step), root_radius * math.sin(angle_base + 3*angle_step), 0))
+
+points.append(points[0]) # 闭合
+
+# --- 构建实体 ---
+wire = Part.makePolygon(points)
+face = Part.Face(wire)
+gear_solid = face.extrude(Vector(0, 0, thickness))
+
+# 挖孔
+hole = Part.makeCylinder(mod * num_teeth / 8.0, thickness)
+final_shape = gear_solid.cut(hole)
+
+# --- 更新文档 ---
+old_obj = doc.getObject(f"Gear_{{num_teeth}}T")
+if old_obj:
+    doc.removeObject(f"Gear_{{num_teeth}}T")
+
+gear_obj = doc.addObject("Part::Feature", f"Gear_{{num_teeth}}T")
+gear_obj.Shape = final_shape
+
+doc.recompute()
+FreeCAD.Gui.SendMsgToActiveView("ViewFit") # 强制对焦
+"""
+    res = freecad.execute_code(code)
+    
+    if res.get("success"):
+        # ⚠️ 关键修改：只返回字符串，不返回 ImageContent，彻底解决 Pydantic 报错
+        return f"Success: Created a 3D Gear with {teeth} teeth. Object name: Gear_{teeth}T"
+    else:
+        return f"Error creating gear: {res.get('error')}"
 
 @mcp.tool()
 def get_objects(ctx: Context, doc_name: str) -> list[TextContent | ImageContent]:
@@ -853,3 +1002,6 @@ def main():
     _only_text_feedback = args.only_text_feedback
     logger.info(f"Only text feedback: {_only_text_feedback}")
     mcp.run()
+
+if __name__ == "__main__":
+    main()
